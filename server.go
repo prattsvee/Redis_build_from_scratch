@@ -9,35 +9,52 @@ import (
 func main() {
 	fmt.Println("Listening on port :6379")
 
-	// Create a new TCP server listening on port 6379
+	// Create a new server
 	l, err := net.Listen("tcp", ":6379")
 	if err != nil {
-		fmt.Println("Error listening:", err)
+		fmt.Println(err)
 		return
 	}
-	defer l.Close()
 
-	// Continuously listen for incoming connections
-	for {
-		conn, err := l.Accept()
-		if err != nil {
-			fmt.Println("Error accepting connection:", err)
-			continue
+	// Create AOF
+	aof, err := NewAof("database.aof")
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer aof.Close()
+
+	// Replay AOF commands at startup
+	err = aof.Read(func(value Value) {
+		command := strings.ToUpper(value.array[0].bulk)
+		args := value.array[1:]
+
+		handler, ok := Handlers[command]
+		if !ok {
+			fmt.Println("Invalid command in AOF: ", command)
+			return
 		}
 
-		// Handle each connection concurrently
-		go handleConnection(conn)
+		handler(args)
+	})
+	if err != nil {
+		fmt.Println("Error reading AOF:", err)
 	}
-}
 
-func handleConnection(conn net.Conn) {
+	// Listen for connections
+	conn, err := l.Accept()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
 	defer conn.Close()
 
 	for {
 		resp := NewResp(conn)
 		value, err := resp.Read()
 		if err != nil {
-			fmt.Println("Error reading from client:", err)
+			fmt.Println(err)
 			return
 		}
 
@@ -51,21 +68,24 @@ func handleConnection(conn net.Conn) {
 			continue
 		}
 
-		// Get the command and arguments
 		command := strings.ToUpper(value.array[0].bulk)
 		args := value.array[1:]
 
 		writer := NewWriter(conn)
 
-		// Look up the handler for the command
 		handler, ok := Handlers[command]
 		if !ok {
-			fmt.Println("Invalid command:", command)
-			writer.Write(Value{typ: "error", str: fmt.Sprintf("ERR unknown command '%s'", command)})
+			fmt.Println("Invalid command: ", command)
+			writer.Write(Value{typ: "string", str: ""})
 			continue
 		}
 
-		// Execute the command handler and write the response
+		// If it's a SET or HSET command, write to AOF
+		if command == "SET" || command == "HSET" {
+			aof.Write(value)
+		}
+
+		// Process the command and send the response
 		result := handler(args)
 		writer.Write(result)
 	}
